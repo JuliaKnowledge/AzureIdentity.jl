@@ -1,0 +1,3 @@
+[deps]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+AzureIdentity = "b2c3d4e5-f6a7-8901-bcde-f23456789012"
