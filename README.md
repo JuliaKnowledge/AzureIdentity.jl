@@ -2,7 +2,7 @@
 
 AzureIdentity.jl provides Julia credentials and token helpers for Azure services. It includes service principal credentials, managed identity, workload identity, cached developer credentials, device code and browser sign-in flows, token providers, and persistent token cache support.
 
-Planned repository: <https://github.com/JuliaKnowledge/AzureIdentity.jl>
+Repository: <https://github.com/JuliaKnowledge/AzureIdentity.jl>
 
 ## Installation
 
@@ -10,7 +10,7 @@ Until the package is registered:
 
 ```julia
 using Pkg
-Pkg.develop(path="path/to/AzureIdentity.jl")
+Pkg.add(url="https://github.com/JuliaKnowledge/AzureIdentity.jl")
 ```
 
 After registration:
