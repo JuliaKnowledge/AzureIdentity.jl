@@ -17,6 +17,7 @@ include("utils.jl")
 include("cache.jl")
 include("oauth.jl")
 include("credentials.jl")
+include("_docstrings.jl")
 
 export AbstractAzureCredential,
     AzureAccessToken,
