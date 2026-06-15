@@ -14,6 +14,29 @@
         @test_throws CredentialUnavailableError get_token_info(credential, "https://resource/.default"; claims = "{\"access_token\":{}}")
     end
 
+    @testset "AzureCliCredential treats expiresOn as local time" begin
+        # `expiresOn` (no epoch field) is a naive LOCAL datetime; it must be converted to the
+        # corresponding UTC instant, not interpreted as UTC.
+        local_expiry = Dates.now() + Dates.Hour(1)
+        expires_on_str = Dates.format(local_expiry, Dates.DateFormat("yyyy-mm-dd HH:MM:SS.s"))
+        runtime = AzureIdentity.CredentialRuntime(
+            run_process = (command; timeout = 10) -> AzureIdentity.ProcessResult(
+                exitcode = 0,
+                stdout = JSON3.write(Dict(
+                    "accessToken" => "cli-local-token",
+                    "expiresOn" => expires_on_str,
+                )),
+            ),
+        )
+        credential = AzureCliCredential(runtime = runtime)
+        token = get_token_info(credential, "https://resource/.default")
+        @test token.token == "cli-local-token"
+        # Expiry should be ~1 hour from UTC now regardless of the machine's timezone.
+        expected = AzureIdentity.local_naive_to_utc(Dates.DateTime(expires_on_str, Dates.DateFormat("yyyy-mm-dd HH:MM:SS.s")))
+        @test abs(Dates.value(token.expires_on - expected)) < 2000
+        @test abs(Dates.value(token.expires_on - (Dates.now(Dates.UTC) + Dates.Hour(1)))) < 5000
+    end
+
     @testset "AzurePowerShellCredential parses prefixed output" begin
         runtime = AzureIdentity.CredentialRuntime(
             run_process = (command; timeout = 10) -> AzureIdentity.ProcessResult(

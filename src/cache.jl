@@ -1,10 +1,67 @@
+# Token refresh status, mirroring Python's _internal/utils.py TokenRefreshStatus.
+@enum TokenRefreshStatus REFRESH_NOT_NEEDED REFRESH_RECOMMENDED REFRESH_REQUIRED
+
+"""
+    _refresh_status(token, last_attempt, now)
+
+Determine whether `token` should be refreshed, matching Python's `get_refresh_status`:
+- `REFRESH_REQUIRED`  : token is missing or expired (must refresh).
+- `REFRESH_RECOMMENDED`: token is still valid but `refresh_on` has passed or it's nearing
+  expiry; a refresh should be attempted but the cached token remains usable.
+- `REFRESH_NOT_NEEDED`: token is valid and no refresh is due, or a refresh was attempted
+  within `DEFAULT_TOKEN_REFRESH_RETRY_DELAY`.
+"""
+function _refresh_status(
+    token::Union{Nothing, AzureAccessTokenInfo},
+    last_attempt::Union{Nothing, DateTime},
+    now::DateTime,
+)
+    token === nothing && return REFRESH_REQUIRED
+    now >= token.expires_on && return REFRESH_REQUIRED
+    if last_attempt !== nothing && now - last_attempt < DEFAULT_TOKEN_REFRESH_RETRY_DELAY
+        return REFRESH_NOT_NEEDED
+    end
+    token.refresh_on !== nothing && now >= token.refresh_on && return REFRESH_RECOMMENDED
+    now >= token.expires_on - DEFAULT_TOKEN_REFRESH_OFFSET && return REFRESH_RECOMMENDED
+    return REFRESH_NOT_NEEDED
+end
+
+"""
+    get_cached_token(cache, key; now_fn)
+
+Return the cached token if it is still usable, else `nothing`. A token whose `refresh_on`
+has passed but which is not yet expired is still returned (it remains usable while a
+proactive refresh is attempted by the caller). Returns `nothing` only for a hard miss
+(no entry or an expired token).
+"""
 function get_cached_token(cache::AccessTokenCache, key::AbstractString; now_fn::Function = () -> Dates.now(Dates.UTC))
     lock(cache.lock) do
         token = get(cache.tokens, String(key), nothing)
         token === nothing && return nothing
-        token.refresh_on !== nothing && now_fn() >= token.refresh_on && return nothing
         return is_expired(token; now_fn = now_fn) ? nothing : token
     end
+end
+
+"""
+    cached_token_status(cache, key; now_fn)
+
+Return `(token, status)` where `status` is a `TokenRefreshStatus`. The token is returned
+even when a refresh is recommended so callers can fall back to it if refresh fails.
+"""
+function cached_token_status(cache::AccessTokenCache, key::AbstractString; now_fn::Function = () -> Dates.now(Dates.UTC))
+    lock(cache.lock) do
+        skey = String(key)
+        token = get(cache.tokens, skey, nothing)
+        last_attempt = get(cache.last_refresh_attempt, skey, nothing)
+        return token, _refresh_status(token, last_attempt, now_fn())
+    end
+end
+
+function mark_refresh_attempt!(cache::AccessTokenCache, key::AbstractString, when::DateTime)
+    lock(cache.lock) do
+        cache.last_refresh_attempt[String(key)] = when
+    end
+    return nothing
 end
 
 function put_cached_token!(cache::AccessTokenCache, key::AbstractString, token::AzureAccessTokenInfo)
@@ -17,6 +74,7 @@ end
 function clear_cache!(cache::AccessTokenCache)
     lock(cache.lock) do
         empty!(cache.tokens)
+        empty!(cache.last_refresh_attempt)
     end
     return nothing
 end

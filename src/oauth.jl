@@ -24,13 +24,10 @@ function _oauth_form_request(runtime::CredentialRuntime, url::String, form::Dict
 end
 
 function _oauth_error_message(payload::Dict{String, Any}, default_message::String)
-    error_code = get(payload, "error", nothing)
     error_description = get(payload, "error_description", nothing)
-    if error_description !== nothing
-        return String(error_description)
-    elseif error_code !== nothing
-        return String(error_code)
-    end
+    error_description !== nothing && return String(error_description)
+    error_code = get(payload, "error", nothing)
+    error_code !== nothing && return String(error_code)
     return default_message
 end
 

@@ -14,8 +14,8 @@ const DEFAULT_TOKEN_REFRESH_RETRY_DELAY = Dates.Second(30)
 const DEFAULT_SHARED_CACHE_DIRECTORY = joinpath(homedir(), ".IdentityService")
 const INSTANCE_DISCOVERY_ENDPOINT = "https://login.microsoft.com/common/discovery/instance"
 const INSTANCE_DISCOVERY_API_VERSION = "1.1"
-const CACHE_NON_CAE_SUFFIX = ".nocae.json"
-const CACHE_CAE_SUFFIX = ".cae.json"
+const CACHE_NON_CAE_SUFFIX = ".nocae"
+const CACHE_CAE_SUFFIX = ".cae"
 const AZURE_PIPELINES_OIDC_API_VERSION = "7.1"
 const AZURE_PIPELINES_TROUBLESHOOTING_GUIDE = "https://aka.ms/azsdk/python/identity/azurepipelinescredential/troubleshoot"
 

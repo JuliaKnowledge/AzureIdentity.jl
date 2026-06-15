@@ -7,6 +7,30 @@ function authenticate end
 datetime_to_epoch(dt::DateTime) = round(Int, Dates.datetime2unix(dt))
 epoch_to_datetime(value::Integer) = Dates.unix2datetime(Int(value))
 
+# Interpret a naive datetime as local wall-clock time and convert it to the equivalent
+# UTC instant (mirrors Python's datetime.timestamp() on a naive datetime). Used for the
+# Azure CLI `expiresOn` field, which is a naive local datetime.
+function local_naive_to_utc(dt::DateTime)
+    epoch = datetime_to_epoch(dt) - _local_utc_offset_seconds(dt)
+    return epoch_to_datetime(epoch)
+end
+
+function _local_utc_offset_seconds(dt::DateTime)
+    # Local-to-UTC offset (seconds) appropriate for the wall-clock instant `dt`,
+    # accounting for DST *at that date* rather than the current offset. We locate the
+    # epoch whose local broken-down time matches `dt`; one refinement step settles the
+    # DST boundary. Uses `Libc.TmStruct(::Real)` (localtime_r) so it stays portable.
+    utc_guess = datetime_to_epoch(dt)
+    offset = 0
+    for _ in 1:2
+        lt = Libc.TmStruct(utc_guess - offset)
+        local_dt = DateTime(lt.year + 1900, lt.month + 1, lt.mday, lt.hour, lt.min, lt.sec)
+        utc_dt = epoch_to_datetime(utc_guess - offset)
+        offset = round(Int, Dates.value(local_dt - utc_dt) / 1000)
+    end
+    return offset
+end
+
 function is_expired(
     token::Union{AzureAccessToken, AzureAccessTokenInfo};
     offset::Dates.Period = DEFAULT_TOKEN_REFRESH_OFFSET,
@@ -26,7 +50,7 @@ function base64url_decode(text::AbstractString)
 end
 
 function normalize_authority(authority::AbstractString)
-    stripped = String(rstrip(String(authority), [' ', '/']))
+    stripped = String(rstrip(authority, [' ', '/']))
     isempty(stripped) && throw(ArgumentError("authority must not be empty"))
     if occursin("://", stripped)
         startswith(stripped, "https://") || throw(ArgumentError("authority must use https"))
@@ -90,11 +114,7 @@ function resolve_tenant(
     tenant_id::Union{Nothing, String} = nothing,
     additionally_allowed_tenants::Vector{String} = String[],
 )
-    if isnothing(tenant_id) || tenant_id == default_tenant
-        return something(default_tenant, tenant_id, "")
-    end
-
-    if get(ENV, ENV_AZURE_IDENTITY_DISABLE_MULTITENANTAUTH, "") != ""
+    if isnothing(tenant_id) || tenant_id == default_tenant || get(ENV, ENV_AZURE_IDENTITY_DISABLE_MULTITENANTAUTH, "") != ""
         return something(default_tenant, tenant_id, "")
     end
 
@@ -114,9 +134,7 @@ function resolve_tenant(
 end
 
 function _merge_claims(claims::Union{Nothing, String}, enable_cae::Bool)
-    if !enable_cae
-        return claims
-    end
+    enable_cae || return claims
 
     claims_dict = claims === nothing ? Dict{String, Any}() : JSON3.read(claims, Dict{String, Any})
     access_token = get!(claims_dict, "access_token", Dict{String, Any}())
@@ -160,8 +178,7 @@ end
 load_authentication_record(path::AbstractString) = deserialize_authentication_record(read(path, String))
 
 function _cache_key(scopes::Vararg{String}; tenant_id::Union{Nothing, String} = nothing, claims::Union{Nothing, String} = nothing, enable_cae::Bool = false)
-    normalized_claims = claims === nothing ? "" : claims
-    return join(normalize_scopes(scopes...), " ") * "|" * something(tenant_id, "") * "|" * normalized_claims * "|" * string(enable_cae)
+    return join(normalize_scopes(scopes...), " ") * "|" * something(tenant_id, "") * "|" * something(claims, "") * "|" * string(enable_cae)
 end
 
 function _truthy_env(name::AbstractString)

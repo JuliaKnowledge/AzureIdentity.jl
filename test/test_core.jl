@@ -46,7 +46,16 @@
         refresh_on = Dates.now(Dates.UTC) - Dates.Minute(1),
     )
     AzureIdentity.put_cached_token!(refresh_cache, "stale", stale)
-    @test AzureIdentity.get_cached_token(refresh_cache, "stale"; now_fn = () -> Dates.now(Dates.UTC)) === nothing
+    # A token whose refresh_on has passed but which is not expired is still usable.
+    @test AzureIdentity.get_cached_token(refresh_cache, "stale"; now_fn = () -> Dates.now(Dates.UTC)) === stale
+    # ...but its refresh status is RECOMMENDED so callers attempt a proactive refresh.
+    _, status = AzureIdentity.cached_token_status(refresh_cache, "stale"; now_fn = () -> Dates.now(Dates.UTC))
+    @test status == AzureIdentity.REFRESH_RECOMMENDED
+
+    # An expired token is a hard miss.
+    expired_cache = AzureIdentity.AccessTokenCache()
+    AzureIdentity.put_cached_token!(expired_cache, "gone", AzureAccessTokenInfo(token = "gone", expires_on = Dates.now(Dates.UTC) - Dates.Minute(1)))
+    @test AzureIdentity.get_cached_token(expired_cache, "gone"; now_fn = () -> Dates.now(Dates.UTC)) === nothing
 
     provider = get_bearer_token_provider(MockCredential(0), "scope/.default")
     @test startswith(provider(), "mock-token-")

@@ -1,9 +1,28 @@
 function _with_cache(cache::AccessTokenCache, runtime::CredentialRuntime, key::String, acquire::Function)
-    cached = get_cached_token(cache, key; now_fn = runtime.now_fn)
-    cached !== nothing && return cached
-    token = acquire()
-    put_cached_token!(cache, key, token)
-    return token
+    token, status = cached_token_status(cache, key; now_fn = runtime.now_fn)
+
+    if status == REFRESH_NOT_NEEDED && token !== nothing
+        return token
+    end
+
+    if status == REFRESH_RECOMMENDED && token !== nothing
+        # Proactive refresh: attempt to refresh but keep the still-valid cached token if it
+        # fails, and throttle repeat attempts via DEFAULT_TOKEN_REFRESH_RETRY_DELAY.
+        mark_refresh_attempt!(cache, key, runtime.now_fn())
+        try
+            refreshed = acquire()
+            put_cached_token!(cache, key, refreshed)
+            return refreshed
+        catch
+            return token
+        end
+    end
+
+    # REFRESH_REQUIRED (or no usable cached token): must acquire a new token.
+    mark_refresh_attempt!(cache, key, runtime.now_fn())
+    new_token = acquire()
+    put_cached_token!(cache, key, new_token)
+    return new_token
 end
 
 mutable struct CachedCredential <: AbstractAzureCredential
@@ -609,11 +628,28 @@ function _managed_identity_params(credential::ManagedIdentityCredential, style::
 end
 
 function _parse_managed_identity_token(payload::Dict{String, Any}, resource::String, runtime::CredentialRuntime)
-    expires_on = haskey(payload, "expires_on") ? _parse_expires_on(payload["expires_on"], runtime.now_fn) : runtime.now_fn() + Dates.Hour(1)
+    now = runtime.now_fn()
+    expires_in = haskey(payload, "expires_in") ? tryparse(Int, string(payload["expires_in"])) : nothing
+    expires_on = if haskey(payload, "expires_on")
+        _parse_expires_on(payload["expires_on"], runtime.now_fn)
+    elseif expires_in !== nothing
+        now + Dates.Second(expires_in)
+    else
+        now + Dates.Hour(1)
+    end
+    # Match Python's managed_identity_client: long-lived tokens get a half-life proactive refresh.
+    refresh_on = if haskey(payload, "refresh_in")
+        now + Dates.Second(parse(Int, string(payload["refresh_in"])))
+    elseif expires_in !== nothing && expires_in >= 7200
+        now + Dates.Second(expires_in ÷ 2)
+    else
+        nothing
+    end
     return AzureAccessTokenInfo(
         token = String(payload["access_token"]),
         expires_on = expires_on,
         token_type = String(get(payload, "token_type", "Bearer")),
+        refresh_on = refresh_on,
         resource = get(payload, "resource", resource),
         scopes = [resource],
         tenant_id = get(payload, "tenant", nothing),
@@ -632,9 +668,7 @@ function _managed_identity_request(credential::ManagedIdentityCredential, method
 end
 
 function _managed_identity_from_workload(credential::ManagedIdentityCredential, scopes::Vector{String}; kwargs...)
-    if credential.exclude_workload_identity_credential
-        return nothing
-    end
+    credential.exclude_workload_identity_credential && return nothing
     if haskey(ENV, ENV_AZURE_FEDERATED_TOKEN_FILE) && haskey(ENV, ENV_AZURE_TENANT_ID) && (credential.client_id !== nothing || haskey(ENV, ENV_AZURE_CLIENT_ID))
         workload = WorkloadIdentityCredential(
             tenant_id = get(ENV, ENV_AZURE_TENANT_ID, nothing),
@@ -656,23 +690,10 @@ function _managed_identity_token(credential::ManagedIdentityCredential, scopes::
     workload_token = _managed_identity_from_workload(credential, scopes; tenant_id = opts.tenant_id)
     workload_token !== nothing && return workload_token
 
-    if haskey(ENV, ENV_IDENTITY_ENDPOINT) && haskey(ENV, ENV_IDENTITY_HEADER) && haskey(ENV, ENV_IMDS_ENDPOINT)
-        credential.client_id === nothing || throw(ClientAuthenticationError("Azure Arc does not support specifying client_id."))
-        url = ENV[ENV_IDENTITY_ENDPOINT]
-        query = Dict("api-version" => "2020-06-01", "resource" => resource)
-        headers = Dict("Metadata" => "true")
-        response, payload = _managed_identity_request(credential, "GET", url; headers, query)
-        if response.status == 401
-            challenge = get(response.headers, "WWW-Authenticate", get(response.headers, "Www-Authenticate", nothing))
-            challenge === nothing && throw(ClientAuthenticationError("Azure Arc did not provide a challenge file path."))
-            secret_path = strip(split(challenge, "=")[end], ['"', ' '])
-            secret = strip(read(secret_path, String))
-            headers["Authorization"] = "Basic $secret"
-            response, payload = _managed_identity_request(credential, "GET", url; headers, query)
-        end
-        response.status == 200 || throw(CredentialUnavailableError(_oauth_error_message(payload, "Azure Arc managed identity unavailable.")))
-        return _parse_managed_identity_token(payload, resource, credential.runtime)
-    elseif haskey(ENV, ENV_IDENTITY_ENDPOINT) && haskey(ENV, ENV_IDENTITY_HEADER) && haskey(ENV, ENV_IDENTITY_SERVER_THUMBPRINT)
+    # Detection order mirrors Python's ManagedIdentityCredential: when IDENTITY_ENDPOINT is
+    # set, IDENTITY_HEADER selects App Service / Service Fabric; Azure Arc is selected only
+    # when IDENTITY_HEADER is absent and IMDS_ENDPOINT is present.
+    if haskey(ENV, ENV_IDENTITY_ENDPOINT) && haskey(ENV, ENV_IDENTITY_HEADER) && haskey(ENV, ENV_IDENTITY_SERVER_THUMBPRINT)
         isempty(credential.identity_config) || throw(ClientAuthenticationError("Service Fabric does not support identity_config overrides."))
         credential.client_id === nothing || throw(ClientAuthenticationError("Service Fabric does not support specifying client_id."))
         url = ENV[ENV_IDENTITY_ENDPOINT]
@@ -688,6 +709,27 @@ function _managed_identity_token(credential::ManagedIdentityCredential, scopes::
         headers = Dict("X-IDENTITY-HEADER" => ENV[ENV_IDENTITY_HEADER])
         response, payload = _managed_identity_request(credential, "GET", url; headers, query)
         response.status == 200 || throw(CredentialUnavailableError(_oauth_error_message(payload, "App Service managed identity unavailable.")))
+        return _parse_managed_identity_token(payload, resource, credential.runtime)
+    elseif haskey(ENV, ENV_IDENTITY_ENDPOINT) && haskey(ENV, ENV_IMDS_ENDPOINT)
+        # Azure Arc: real Arc hosts set IDENTITY_ENDPOINT and IMDS_ENDPOINT but NOT IDENTITY_HEADER.
+        isempty(credential.identity_config) || throw(ClientAuthenticationError("Azure Arc does not support user-assigned managed identities (identity_config)."))
+        credential.client_id === nothing || throw(ClientAuthenticationError("Azure Arc does not support specifying client_id."))
+        url = ENV[ENV_IDENTITY_ENDPOINT]
+        query = Dict("api-version" => "2020-06-01", "resource" => resource)
+        headers = Dict("Metadata" => "true")
+        response, payload = _managed_identity_request(credential, "GET", url; headers, query)
+        if response.status == 401
+            # Arc challenge: WWW-Authenticate carries the path to a secret file; retry with Basic auth.
+            challenge = get(response.headers, "WWW-Authenticate", get(response.headers, "Www-Authenticate", nothing))
+            challenge === nothing && throw(ClientAuthenticationError("Did not receive a value from WWW-Authenticate header"))
+            parts = split(challenge, "=")
+            length(parts) >= 2 || throw(ClientAuthenticationError("Did not receive a correct value from WWW-Authenticate header: $challenge"))
+            secret_path = strip(parts[end], ['"', ' '])
+            secret = read(secret_path, String)
+            headers["Authorization"] = "Basic $secret"
+            response, payload = _managed_identity_request(credential, "GET", url; headers, query)
+        end
+        response.status == 200 || throw(CredentialUnavailableError(_oauth_error_message(payload, "Azure Arc managed identity unavailable.")))
         return _parse_managed_identity_token(payload, resource, credential.runtime)
     elseif haskey(ENV, ENV_MSI_ENDPOINT) && haskey(ENV, ENV_MSI_SECRET)
         url = ENV[ENV_MSI_ENDPOINT]
@@ -730,7 +772,11 @@ end
 
 function get_token_info(credential::ManagedIdentityCredential, scopes::Vararg{String}; options::Union{Nothing, TokenRequestOptions} = nothing, claims = nothing, tenant_id = nothing, enable_cae::Bool = false)
     normalized_scopes = normalize_scopes(scopes...)
-    key = _cache_key(normalized_scopes...; claims = claims, enable_cae = enable_cae)
+    # Coerce options into the cache key (consistent with the other credentials) so that
+    # requests differing only via `options` (enable_cae/tenant_id/claims) don't collide.
+    opts = _coerce_options(; options, claims, tenant_id, enable_cae)
+    merged_claims = _merge_claims(opts.claims, opts.enable_cae)
+    key = _cache_key(normalized_scopes...; tenant_id = opts.tenant_id, claims = merged_claims, enable_cae = opts.enable_cae)
     return _with_cache(credential.cache, credential.runtime, key, () -> begin
         _managed_identity_token(credential, normalized_scopes; options, claims, tenant_id, enable_cae)
     end)
@@ -752,10 +798,13 @@ end
 
 function _parse_azure_cli_token(output::String)
     payload = JSON3.read(output, Dict{String, Any})
+    # Prefer the epoch `expires_on` field (newer az versions). Otherwise fall back to the
+    # `expiresOn` string, which the CLI emits as a naive LOCAL datetime; convert it to the
+    # corresponding UTC instant so is_expired comparisons against UTC `now` are correct.
     expires_on = if haskey(payload, "expires_on")
         _parse_expires_on(payload["expires_on"])
     else
-        _parse_expires_on(payload["expiresOn"])
+        local_naive_to_utc(_parse_datetime_string(strip(String(payload["expiresOn"]))))
     end
     return AzureAccessTokenInfo(
         token = String(payload["accessToken"]),
@@ -817,7 +866,10 @@ function get_token_info(credential::AzurePowerShellCredential, scopes::Vararg{St
     \$token = Get-AzAccessToken @params
     Write-Output "azsdk%\$((\$token.Token | Out-String).Trim())%\$([int][double]::Parse((Get-Date \$token.ExpiresOn -UFormat %s)))"
     """
-    command = `pwsh -NoProfile -Command $script`
+    executable = Sys.which("pwsh")
+    executable === nothing && (executable = Sys.which("powershell"))
+    executable === nothing && throw(CredentialUnavailableError("PowerShell is not installed."))
+    command = `$executable -NoProfile -Command $script`
     result = _run_process(credential, command)
     result.exitcode == 0 || throw(CredentialUnavailableError(isempty(result.stderr) ? "Azure PowerShell authentication unavailable." : strip(result.stderr)))
     token = _parse_powershell_token(result.stdout)
@@ -1260,7 +1312,7 @@ function _credential_mode_exclusions(exclude_flags::Dict{Symbol, Bool})
         return exclude_flags
     elseif selection == "dev"
         for key in keys(exclude_flags)
-            exclude_flags[key] = !(key in (:shared_token_cache, :visual_studio_code, :cli, :powershell, :developer_cli, :interactive_browser))
+            exclude_flags[key] = !(key in (:shared_token_cache, :visual_studio_code, :cli, :powershell, :developer_cli))
         end
     elseif selection == "prod"
         for key in keys(exclude_flags)

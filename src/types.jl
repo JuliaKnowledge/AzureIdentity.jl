@@ -73,6 +73,7 @@ end
 
 Base.@kwdef mutable struct AccessTokenCache
     tokens::Dict{String, AzureAccessTokenInfo} = Dict{String, AzureAccessTokenInfo}()
+    last_refresh_attempt::Dict{String, DateTime} = Dict{String, DateTime}()
     lock::ReentrantLock = ReentrantLock()
 end
 
